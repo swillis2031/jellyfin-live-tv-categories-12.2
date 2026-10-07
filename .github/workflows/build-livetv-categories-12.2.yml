@@ -1,0 +1,264 @@
+name: Build Live TV Categories for Jellyfin 12.2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN_VERSION: 0.4.0.1
+  JELLYFIN_VERSION: 12.2.0
+  JELLYFIN_ABI: 12.2.0.0
+  RELEASE_TAG: v0.4.0.1-jf12.2
+  PACKAGE_NAME: Jellyfin.Plugin.LiveTvCategories_0.4.0.1.zip
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get Live TV Categories source
+        uses: actions/checkout@v4
+        with:
+          repository: JeKaQM/jellyfin-live-tv-category-browser
+          ref: main
+          path: source
+
+      - name: Get Jellyfin Web 12.2
+        uses: actions/checkout@v4
+        with:
+          repository: jellyfin/jellyfin-web
+          ref: v12.2
+          path: jellyfin-web
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Patch plugin for Jellyfin 12.2
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              if old not in text:
+                  raise SystemExit(f"Expected text not found in {path}: {old!r}")
+              p.write_text(text.replace(old, new), encoding="utf-8")
+
+          replace(
+              "source/Jellyfin.Plugin.LiveTvCategories/Jellyfin.Plugin.LiveTvCategories.csproj",
+              'Version="12.1.0"',
+              'Version="12.2.0"',
+          )
+
+          replace(
+              "source/Jellyfin.Plugin.LiveTvCategories/WebClient/PluginWebClientStartupFilter.cs",
+              "new(12, 1, 0, 0)",
+              "new(12, 2, 0, 0)",
+          )
+
+          props = Path("source/Directory.Build.props")
+          text = props.read_text(encoding="utf-8")
+          text = text.replace("<Version>0.4.0.0</Version>", "<Version>0.4.0.1</Version>")
+          text = text.replace("<AssemblyVersion>0.4.0.0</AssemblyVersion>", "<AssemblyVersion>0.4.0.1</AssemblyVersion>")
+          text = text.replace("<FileVersion>0.4.0.0</FileVersion>", "<FileVersion>0.4.0.1</FileVersion>")
+          props.write_text(text, encoding="utf-8")
+
+          replace(
+              "source/build.yaml",
+              'version: "0.4.0.0"',
+              'version: "0.4.0.1"',
+          )
+          replace(
+              "source/build.yaml",
+              'targetAbi: "12.1.0.0"',
+              'targetAbi: "12.2.0.0"',
+          )
+          PY
+
+      - name: Verify Jellyfin Web 12.2 files match the 12.1 overlay base
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_hash() {
+            file="$1"
+            expected="$2"
+            actual="$(git -C jellyfin-web hash-object "$file")"
+
+            echo "$file"
+            echo "  expected: $expected"
+            echo "  actual:   $actual"
+
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::Jellyfin Web 12.2 changed a file the plugin replaces. Stopping instead of applying a potentially unsafe overlay."
+              exit 1
+            fi
+          }
+
+          check_hash \
+            "src/apps/legacy/controllers/livetv/livetvsuggested.js" \
+            "49699fd4f2588f0be26f5f421e3ee44bddaf6f09"
+
+          check_hash \
+            "src/apps/legacy/controllers/livetv.html" \
+            "365c5b4415c55f50eccab101bfd483390ab90eab"
+
+          check_hash \
+            "src/apps/modern/features/libraries/components/PageTabContent.tsx" \
+            "430e09f6737f18ed1c06210a18cf62d556717922"
+
+      - name: Apply Live TV Categories Web overlay to Jellyfin Web 12.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a source/web/patches/jellyfin-web-12.1/. jellyfin-web/
+
+      - name: Build Jellyfin Web 12.2 with category browser
+        working-directory: jellyfin-web
+        shell: bash
+        run: |
+          npm ci
+          npm run build:production
+
+      - name: Build server plugin against Jellyfin 12.2
+        shell: bash
+        run: |
+          dotnet publish \
+            source/Jellyfin.Plugin.LiveTvCategories/Jellyfin.Plugin.LiveTvCategories.csproj \
+            --configuration Release \
+            --no-self-contained \
+            --output artifacts/plugin
+
+      - name: Package plugin ZIP
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          import zipfile
+
+          stage = Path("artifacts/stage")
+          package = Path("artifacts") / "Jellyfin.Plugin.LiveTvCategories_0.4.0.1.zip"
+
+          if stage.exists():
+              shutil.rmtree(stage)
+
+          (stage / "web").mkdir(parents=True)
+
+          shutil.copy2(
+              "artifacts/plugin/Jellyfin.Plugin.LiveTvCategories.dll",
+              stage / "Jellyfin.Plugin.LiveTvCategories.dll",
+          )
+          shutil.copy2("source/LICENSE", stage / "LICENSE")
+          shutil.copy2("source/NOTICE.md", stage / "NOTICE.md")
+
+          web_dist = Path("jellyfin-web/dist")
+          if not (web_dist / "index.html").exists():
+              raise SystemExit("Jellyfin Web build is missing dist/index.html")
+
+          shutil.copytree(web_dist, stage / "web", dirs_exist_ok=True)
+
+          (stage / "SOURCE.txt").write_text(
+              "UNOFFICIAL TEMPORARY JELLYFIN 12.2 BUILD\n"
+              "=======================================\n\n"
+              "Plugin source: https://github.com/JeKaQM/jellyfin-live-tv-category-browser\n"
+              "Original plugin release: 0.4.0.0 for Jellyfin 12.1\n"
+              "Temporary build version: 0.4.0.1\n"
+              "Server target: Jellyfin 12.2.0\n"
+              "Jellyfin Web source: https://github.com/jellyfin/jellyfin-web/tree/v12.2\n\n"
+              "The existing GPL-2.0 Live TV Categories Web overlay was applied to "
+              "Jellyfin Web 12.2 after verifying the three upstream files replaced "
+              "by the overlay are byte-identical to the expected 12.1 base files.\n",
+              encoding="utf-8",
+          )
+
+          with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+              for p in sorted(stage.rglob("*")):
+                  if p.is_file():
+                      z.write(p, p.relative_to(stage).as_posix())
+
+          print(package)
+          PY
+
+      - name: Create Jellyfin repository manifest
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["RELEASE_TAG"]
+          package_name = os.environ["PACKAGE_NAME"]
+          package = Path("artifacts") / package_name
+
+          checksum = hashlib.md5(package.read_bytes()).hexdigest().upper()
+          source_url = f"https://github.com/{repo}/releases/download/{tag}/{package_name}"
+
+          manifest = [{
+              "guid": "a4b2fdc8-cb2a-463b-812a-16e9ea88e12a",
+              "name": "Live TV Categories",
+              "overview": "Dynamic category-first browsing for Jellyfin Live TV",
+              "description": "Unofficial temporary Jellyfin 12.2 build of JeKaQM's Live TV Categories plugin.",
+              "owner": "jeno / temporary 12.2 compatibility build",
+              "category": "Live TV",
+              "versions": [{
+                  "version": os.environ["PLUGIN_VERSION"],
+                  "changelog": (
+                      "UNOFFICIAL temporary Jellyfin 12.2 build. "
+                      "Server plugin rebuilt against Jellyfin 12.2 and the existing "
+                      "Live TV Categories Web overlay applied to Jellyfin Web 12.2."
+                  ),
+                  "targetAbi": os.environ["JELLYFIN_ABI"],
+                  "sourceUrl": source_url,
+                  "checksum": checksum,
+                  "timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+              }]
+          }]
+
+          Path("artifacts/manifest.json").write_text(
+              json.dumps(manifest, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          print("MD5:", checksum)
+          print("sourceUrl:", source_url)
+          PY
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Live-TV-Categories-Jellyfin-12.2
+          path: |
+            artifacts/Jellyfin.Plugin.LiveTvCategories_0.4.0.1.zip
+            artifacts/manifest.json
+
+      - name: Publish/update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Live TV Categories 0.4.0.1 - Jellyfin 12.2 temporary build
+          body: |
+            UNOFFICIAL temporary compatibility build.
+
+            Based on JeKaQM Live TV Categories 0.4.0.0.
+            Rebuilt against Jellyfin Server 12.2 and Jellyfin Web 12.2.
+            Remove this temporary repository once an official Jellyfin 12.2 release is available.
+          make_latest: true
+          files: |
+            artifacts/Jellyfin.Plugin.LiveTvCategories_0.4.0.1.zip
+            artifacts/manifest.json
